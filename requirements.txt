@@ -1,2 +1,4 @@
+websockets
 aiohttp
-requests
+psutil
+grpcio-tools
