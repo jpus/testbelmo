@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Green Space</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Roboto, system-ui, sans-serif;
+            background: linear-gradient(145deg, #e8f5e9 0%, #c8e6c9 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            max-width: 750px;
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            padding: 40px 35px;
+            border-radius: 48px;
+            box-shadow: 0 30px 60px rgba(46, 125, 50, 0.2),
+                        0 10px 25px rgba(0, 0, 0, 0.05);
+            border: 1px solid rgba(129, 199, 132, 0.3);
+            text-align: center;
+        }
+        h1 {
+            font-size: 2.5rem;
+            color: #1b5e20;
+            margin-bottom: 20px;
+            font-weight: 600;
+            letter-spacing: -0.5px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+        }
+        h1 span {
+            font-size: 2.8rem;
+        }
+        .subhead {
+            font-size: 1.2rem;
+            color: #2e7d32;
+            margin-bottom: 35px;
+            font-weight: 350;
+            line-height: 1.6;
+            background: #f1f8e9;
+            padding: 16px 25px;
+            border-radius: 100px;
+            display: inline-block;
+            backdrop-filter: blur(4px);
+            border: 1px solid #a5d6a7;
+        }
+        .quote-card {
+            background: #ffffffc9;
+            padding: 30px 25px;
+            border-radius: 32px;
+            margin: 30px 0 20px;
+            border-left: 8px solid #2e7d32;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.03);
+        }
+        .quote-text {
+            font-size: 1.5rem;
+            color: #1f3b1f;
+            font-style: italic;
+            line-height: 1.5;
+            margin-bottom: 20px;
+            font-weight: 400;
+        }
+        .quote-author {
+            font-size: 1rem;
+            color: #558b2f;
+            letter-spacing: 1px;
+            font-weight: 500;
+            text-transform: uppercase;
+        }
+        .tips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            justify-content: center;
+            margin: 40px 0 20px;
+        }
+        .tip-item {
+            background: #f1f8e9;
+            padding: 14px 25px;
+            border-radius: 60px;
+            font-size: 1.1rem;
+            color: #1f4f1f;
+            font-weight: 500;
+            box-shadow: 0 4px 8px #c5e1a5;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            border: 1px solid #9ccc65;
+        }
+        .footer {
+            margin-top: 45px;
+            font-size: 0.9rem;
+            color: #558b2f;
+            border-top: 2px dashed #a5d6a7;
+            padding-top: 25px;
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer a {
+            color: #1b5e20;
+            text-decoration: none;
+            font-weight: 500;
+            transition: all 0.2s;
+            border-bottom: 2px solid transparent;
+        }
+        .footer a:hover {
+            border-bottom-color: #2e7d32;
+        }
+        .leaf-icon {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            background: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%232e7d32"><path d="M12,2C9,7,4,9,4,14c0,4,4,6,8,6s8-2,8-6C20,9,15,7,12,2z"/></svg>') no-repeat center;
+            background-size: contain;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>
+            <span>🌿</span> GREEN BREATH <span>🌱</span>
+        </h1>
+        <div class="subhead">
+            ⏳ Every step greens the Earth · Have you reduced your carbon today?
+        </div>
+
+        <div class="quote-card">
+            <div class="quote-text">
+                “We do not inherit the earth from our ancestors; we borrow it from our children.”
+            </div>
+            <div class="quote-author">—— Native American Proverb</div>
+        </div>
+
+        <div class="tips">
+            <div class="tip-item">🚲 Bike instead of drive</div>
+            <div class="tip-item">💡 Switch off lights</div>
+            <div class="tip-item">🛍️ Reusable bags</div>
+            <div class="tip-item">🌳 Plant a tree monthly</div>
+            <div class="tip-item">💧 Save every drop</div>
+        </div>
+
+        <div style="margin: 25px 0 15px; color: #336633; font-size: 1.2rem;">
+            ✦ Daily eco-effort, brighter Earth smile ✦
+        </div>
+
+        <div class="footer">
+            <a href="#" target="_blank">🌎 Eco Pledge</a>
+            <a href="#" target="_blank">📖 Low-carbon Guide</a>
+            <a href="#" target="_blank">🤝 Join the Action</a>
+        </div>
+        <div style="font-size: 0.85rem; color: #81a781; margin-top: 25px;">
+            🌱 This page's carbon is offset · Green access
+        </div>
+    </div>
+</body>
+</html>
