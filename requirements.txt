@@ -1,4 +1,11 @@
 aiohttp
 psutil
 grpcio
-grpcio-tools
+protobuf
+
+# 可选（但推荐安装，提升系统信息准确性）
+distro
+py-cpuinfo
+
+# 开发时可能需要（生产环境可移除）
+# grpcio-tools
