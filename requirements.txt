@@ -1,4 +1,5 @@
-websockets
+h2
 aiohttp
 psutil
+grpcio
 grpcio-tools

@@ -9,16 +9,20 @@ import socket
 import signal
 import base64
 import asyncio
+import ssl
 import logging
 import argparse
 import platform
-from typing import List
+from typing import List, Dict
 
 # 核心依赖
 import psutil
 import aiohttp
 from aiohttp import web
 import grpc
+import h2.connection
+import h2.events
+import h2.exceptions
 
 # 载入你的 protobuf 结构
 import nezha_pb2 as pb
@@ -52,7 +56,6 @@ current_port = PORT
 tls_mode = "none"
 isp_info = ""
 
-# 🌟 全局双轨状态管理（对应 Java 客户端的属性）
 task_client = None
 state_client = None
 is_task_stream_active = False
@@ -60,14 +63,109 @@ cached_public_ip = "127.0.0.1"
 cached_country_code = "cn"
 start_time = int(time.time())
 
-# 数据统计算法对齐
 last_in_bytes = 0
 last_out_bytes = 0
 last_time_millis = int(time.time() * 1000)
 
 logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ==================== VLESS Over WebSocket 核心代理 ====================
+# ==================== VLESS TCP 转发核心（用于对接隧道内部流与标准WS） ====================
+async def handle_vless_binary_stream(reader, writer, initial_data=b""):
+    """
+    处理拆解出来的纯 VLESS 二进制流（完美避开外部多余的 HTTP 封装）
+    """
+    try:
+        if initial_data:
+            msg = initial_data
+        else:
+            msg = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+    except Exception:
+        try: writer.close()
+        except: pass
+        return
+
+    if len(msg) < 18 or msg[0] != 0:
+        try: writer.close()
+        except: pass
+        return
+        
+    try:
+        uuid_bytes = bytes.fromhex(CLEAN_UUID)
+        if msg[1:17] != uuid_bytes:
+            try: writer.close()
+            except: pass
+            return
+    except Exception:
+        try: writer.close()
+        except: pass
+        return
+        
+    addon_len = msg[17]
+    idx = 18 + addon_len
+    if idx + 3 > len(msg):
+        try: writer.close()
+        except: pass
+        return
+        
+    port = struct.unpack(">H", msg[idx:idx+2])[0]
+    idx += 2
+    atyp = msg[idx]
+    idx += 1
+    
+    if atyp == 1:
+        if idx + 4 > len(msg): return
+        host = socket.inet_ntoa(msg[idx:idx+4])
+        idx += 4
+    elif atyp == 2:
+        if idx >= len(msg): return
+        host_len = msg[idx]
+        idx += 1
+        if idx + host_len > len(msg): return
+        host = msg[idx:idx+host_len].decode('utf-8', errors='ignore')
+        idx += host_len
+    elif atyp == 3:
+        if idx + 16 > len(msg): return
+        host = socket.inet_ntop(socket.AF_INET6, msg[idx:idx+16])
+        idx += 16
+    else:
+        try: writer.close()
+        except: pass
+        return
+
+    # 响应 VLESS 握手成功状态标
+    writer.write(b'\x00\x00')
+    await writer.drain()
+    
+    try:
+        remote_reader, remote_writer = await asyncio.open_connection(host, port)
+    except Exception:
+        try: writer.close()
+        except: pass
+        return
+        
+    if idx < len(msg):
+        remote_writer.write(msg[idx:])
+        await remote_writer.drain()
+
+    async def pipe(r, w):
+        try:
+            while True:
+                data = await r.read(4096)
+                if not data: break
+                w.write(data)
+                await w.drain()
+        except: pass
+        finally:
+            try: w.close()
+            except: pass
+
+    await asyncio.gather(
+        pipe(reader, remote_writer),
+        pipe(remote_reader, writer),
+        return_exceptions=True
+    )
+
+# 标准 HTTP 服务的 WebSocket 桥接器
 async def copy_ws_to_tcp(ws, writer):
     try:
         async for message in ws:
@@ -90,74 +188,28 @@ async def copy_tcp_to_ws(reader, ws):
 async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    try:
-        msg = await asyncio.wait_for(ws.receive_bytes(), timeout=5.0)
-    except Exception:
-        await ws.close()
-        return ws
-
-    if len(msg) < 18 or msg[0] != 0:
-        await ws.close()
-        return ws
-        
-    try:
-        uuid_bytes = bytes.fromhex(CLEAN_UUID)
-        if msg[1:17] != uuid_bytes:
-            await ws.close()
-            return ws
-    except Exception:
-        await ws.close()
-        return ws
-        
-    addon_len = msg[17]
-    idx = 18 + addon_len
-    if idx + 3 > len(msg):
-        await ws.close()
-        return ws
-        
-    port = struct.unpack(">H", msg[idx:idx+2])[0]
-    idx += 2
-    atyp = msg[idx]
-    idx += 1
     
-    if atyp == 1:
-        if idx + 4 > len(msg): await ws.close(); return ws
-        host = socket.inet_ntoa(msg[idx:idx+4])
-        idx += 4
-    elif atyp == 2:
-        if idx >= len(msg): await ws.close(); return ws
-        host_len = msg[idx]
-        idx += 1
-        if idx + host_len > len(msg): await ws.close(); return ws
-        host = msg[idx:idx+host_len].decode('utf-8', errors='ignore')
-        idx += host_len
-    elif atyp == 3:
-        if idx + 16 > len(msg): await ws.close(); return ws
-        host = socket.inet_ntop(socket.AF_INET6, msg[idx:idx+16])
-        idx += 16
-    else:
-        await ws.close()
-        return ws
+    # 模拟建立一对内部 Socket 环路，将标准 WS 请求接入 VLESS 核心处理器
+    loop = asyncio.get_running_loop()
+    rs_in, ws_out = os.pipe()
+    rs_out, ws_in = os.pipe()
+    
+    reader_internal, _ = await asyncio.open_connection(pipe=os.fdopen(rs_in, 'rb'))
+    _, writer_internal = await asyncio.open_connection(pipe=os.fdopen(ws_in, 'wb'))
+    
+    reader_core, _ = await asyncio.open_connection(pipe=os.fdopen(rs_out, 'rb'))
+    _, writer_core = await asyncio.open_connection(pipe=os.fdopen(ws_out, 'wb'))
 
-    await ws.send_bytes(b'\x00\x00')
-    try:
-        reader, writer = await asyncio.open_connection(host, port)
-    except Exception:
-        await ws.close()
-        return ws
-        
-    if idx < len(msg):
-        writer.write(msg[idx:])
-        await writer.drain()
-        
+    asyncio.create_task(handle_vless_binary_stream(reader_core, writer_core))
+    
     await asyncio.gather(
-        copy_ws_to_tcp(ws, writer),
-        copy_tcp_to_ws(reader, ws),
+        copy_ws_to_tcp(ws, writer_internal),
+        copy_tcp_to_ws(reader_internal, ws),
         return_exceptions=True
     )
     return ws
 
-# ==================== 订阅与 IP 获取对齐 ====================
+# ==================== 订阅管理 ====================
 async def index_handler(request):
     if os.path.exists("index.html"): return web.FileResponse("index.html")
     return web.Response(text="Hello world!")
@@ -172,7 +224,6 @@ async def sub_handler(request):
     return web.Response(text=encoded + "\n", content_type="text/plain")
 
 async def async_fetch_ip_and_country():
-    """完全复制 Java 的 asyncFetchIpAndCountry 复合逻辑"""
     global cached_public_ip, cached_country_code
     ipv4, ipv6, country = None, None, "un"
     timeout = aiohttp.ClientTimeout(total=3)
@@ -190,13 +241,7 @@ async def async_fetch_ip_and_country():
                 if r.status == 200:
                     code = (await r.json()).get("country_code", "").lower()
                     if len(code) == 2: country = code
-        except:
-            try:
-                async with session.get("https://ipapi.co/country/", headers={"User-Agent": "curl/7.81.0"}) as r:
-                    if r.status == 200:
-                        code = (await r.text()).strip().lower()[:2]
-                        if code.isalpha(): country = code
-            except: pass
+        except: pass
 
     if ipv4 and ipv6: cached_public_ip = f"{ipv4} / {ipv6}"
     elif ipv4: cached_public_ip = ipv4
@@ -213,11 +258,10 @@ async def get_isp() -> str:
     except: pass
     return "Unknown"
 
-# ==================== 工业级双轨探针数据打包（对齐 v0 协议） ====================
+# ==================== 工业级双轨探针上报（对齐 v0 协议） ====================
 def build_complete_host_info() -> pb.Host:
     vm = psutil.virtual_memory()
     disk_val = psutil.disk_usage('/')
-    
     host = pb.Host()
     host.platform = "debian"
     host.platform_version = "12"
@@ -230,7 +274,6 @@ def build_complete_host_info() -> pb.Host:
     host.boot_time = start_time
     host.ip = cached_public_ip
     host.country_code = cached_country_code
-    # 动态版本对齐 Java: "0.17.9-" + timestamp%100
     host.version = f"0.17.9-{int(time.time() * 1000) % 100}"
     return host
 
@@ -254,9 +297,6 @@ def collect_dynamic_state_payload() -> pb.State:
     last_out_bytes = current_out_bytes
     last_time_millis = current_time_millis
 
-    uptime = int(time.time()) - start_time
-    if uptime <= 0: uptime = 1
-
     state = pb.State()
     state.cpu = psutil.cpu_percent(interval=None) or 1.2
     state.mem_used = vm.used
@@ -266,22 +306,18 @@ def collect_dynamic_state_payload() -> pb.State:
     state.net_out_transfer = current_out_bytes
     state.net_in_speed = net_in_speed
     state.net_out_speed = net_out_speed
-    state.uptime = uptime
-    
+    state.uptime = int(time.time()) - start_time
     try:
         l1, l5, l15 = os.getloadavg()
         state.load1, state.load5, state.load15 = l1, l5, l15
     except:
         state.load1, state.load5, state.load15 = 0.05, 0.04, 0.03
-        
     state.tcp_conn_count = len(psutil.net_connections(kind='tcp')) or 8
     state.udp_conn_count = 1
     state.process_count = len(psutil.pids()) or 45
     return state
 
-# ==================== 物理双通道对齐核心 ====================
 def create_physical_channel(server_addr, use_tls):
-    """创建独立的物理通道"""
     options = [
         ('grpc.keepalive_time_ms', 5000),
         ('grpc.keepalive_timeout_ms', 3000),
@@ -293,27 +329,21 @@ def create_physical_channel(server_addr, use_tls):
         return grpc.aio.insecure_channel(server_addr, options=options)
 
 async def fire_dynamic_state_loop(server_addr, auth_metadata, use_tls):
-    """状态上报轨道 (对应 Java 版本的 stateChannel 独立线程机制)"""
     global state_client
     while True:
         try:
             if state_client is None:
                 channel = create_physical_channel(server_addr, use_tls)
                 state_client = pb_grpc.NezhaServiceStub(channel)
-            
             state_payload = collect_dynamic_state_payload()
-            # 🌟 核心修正：调用方法名必须精准对齐老版（首字母大小写兼容性）
-            # Python grpc 根据 proto 自动生成的存根通常大写，但如果之前打包错误，这里统一根据 stub 内省动态自适应调用
             func = getattr(state_client, 'ReportSystemState', None) or getattr(state_client, 'reportSystemState')
             await func(state_payload, metadata=auth_metadata, timeout=4)
-            
-            await asyncio.sleep(2) # 严格对齐 Java 的 Thread.sleep(2000)
+            await asyncio.sleep(2)
         except Exception:
             state_client = None
             await asyncio.sleep(4)
 
 async def run_nezha_task_loop(server_addr, auth_metadata, use_tls):
-    """下发任务接收轨道 (对应 Java 版本的 taskChannel 独立控制机制)"""
     global task_client, is_task_stream_active
     while True:
         try:
@@ -324,28 +354,22 @@ async def run_nezha_task_loop(server_addr, auth_metadata, use_tls):
 
             if not is_task_stream_active:
                 host_payload = build_complete_host_info()
-                
-                # Java 逻辑第一步：在订阅下发流前，先强制通过静态上报方法推送一次元数据
                 info_func = getattr(task_client, 'ReportSystemInfo', None) or getattr(task_client, 'reportSystemInfo')
                 try: await info_func(host_payload, metadata=auth_metadata, timeout=4)
                 except: pass
                 
-                # Java 逻辑第二步：挂载长流管道
                 task_func = getattr(task_client, 'RequestTask', None) or getattr(task_client, 'requestTask')
                 is_task_stream_active = True
-                
                 async for task in task_func(host_payload, metadata=auth_metadata):
-                    # 收到下发命令直接响应
                     report_func = getattr(task_client, 'ReportTask', None) or getattr(task_client, 'reportTask')
                     res = pb.TaskResult(id=task.id, type=task.type, successful=True, delay=1.0)
                     asyncio.create_task(report_func(res, metadata=auth_metadata))
-                    
         except Exception:
             task_client = None
             is_task_stream_active = False
             await asyncio.sleep(10)
 
-# ==================== Capnp 二进制协议处理 ====================
+# ==================== Capnp 协议构建器 ====================
 class CapnpMessage:
     def __init__(self): self.words = []
     def allocate(self, word_count: int) -> int:
@@ -462,29 +486,128 @@ def capnp_register_connection(question_id, bs_question_id, account_tag, tunnel_s
     msg.write_text(ci_p3, "jpuso")
     return msg.to_bytes()
 
-async def cf_tunnel_connect(conn_index: int, account_tag: str, tunnel_secret: bytes, tunnel_id: bytes):
+# ==================== 核心：HTTP/2 多路复用隧道客户端（对齐 Java 核心） ====================
+class AsyncStreamBridge:
+    """模拟 Socket 的管道，负责将 H2 Stream 与本地 VLESS 处理器无缝连通"""
+    def __init__(self):
+        self.queue = asyncio.Queue()
+    async def read(self, n):
+        return await self.queue.get()
+    def put(self, data):
+        if data: self.queue.put_nowait(data)
+
+class DummyWriter:
+    def __init__(self, stream_id, h2_conn, transport):
+        self.stream_id = stream_id
+        self.h2_conn = h2_conn
+        self.transport = transport
+    def write(self, data):
+        # 将本地 VLESS 回传的数据，包装成 HTTP/2 DATA 帧发送回 Cloudflare 边缘节点
+        chunk_size = 16384
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i+chunk_size]
+            self.h2_conn.send_data(self.stream_id, chunk)
+            self.transport.write(self.h2_conn.data_to_send())
+    async def drain(self):
+        pass
+    def close(self):
+        try:
+            self.h2_conn.end_stream(self.stream_id)
+            self.transport.write(self.h2_conn.data_to_send())
+        except: pass
+
+async def cf_tunnel_h2_worker(conn_index: int, account_tag: str, tunnel_secret: bytes, tunnel_id: bytes):
+    """
+    完整的 HTTP/2 协议实现，通过封装 H2 状态机真正擦亮隧道
+    """
     edges = ["region1.v2.argotunnel.com", "region2.v2.argotunnel.com"]
     client_id = bytes(random.getrandbits(8) for _ in range(32))
+    
     while True:
         try:
             edge = random.choice(edges)
-            reader, writer = await asyncio.open_connection(edge, 7844)
+            # 建立 TLS 连接，并且强制注入 ALPN 协商标识符 ['h2'] 🚀
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            ssl_ctx.set_alpn_protocols(['h2'])
+            
+            loop = asyncio.get_running_loop()
+            reader, writer = await asyncio.open_connection(edge, 7844, ssl=ssl_ctx)
+            transport = writer.transport
+            
+            # 1. 注册基础 RPC 连接
             writer.write(capnp_bootstrap(0))
+            writer.write(capnp_register_connection(1, 0, account_tag, tunnel_secret, tunnel_id, conn_index, client_id))
             await writer.drain()
             
-            reg_packet = capnp_register_connection(1, 0, account_tag, tunnel_secret, tunnel_id, conn_index, client_id)
-            writer.write(reg_packet)
-            await writer.drain()
+            # 2. 初始化本地 Hyper-H2 状态机
+            config = h2.config.H2Configuration(client_side=False) # 隧道服务端模式
+            h2_conn = h2.connection.H2Connection(config=config)
+            h2_conn.initiate_connection()
+            transport.write(h2_conn.data_to_send())
             
+            active_bridges: Dict[int, AsyncStreamBridge] = {}
+            
+            # 3. 开启数据流多路复用监听循环
             while True:
-                heartbeat = await reader.read(2048)
-                if not heartbeat: break
-                writer.write(b'\x00\x00\x00\x00\x01\x00\x00\x00')
-                await writer.drain()
+                data = await reader.read(65536)
+                if not data: break
+                
+                try:
+                    events = h2_conn.receive_data(data)
+                except h2.exceptions.ProtocolError:
+                    break
+                    
+                transport.write(h2_conn.data_to_send())
+                
+                for event in events:
+                    if isinstance(event, h2.events.RequestReceived):
+                        # 收到 Cloudflare 下发的请求标头
+                        headers = dict(event.headers)
+                        path = headers.get(b':path', b'').decode('utf-8').lstrip('/')
+                        
+                        # 校验路径是否与配置的 WSPATH 匹配 🚀
+                        if path == WSPATH or WSPATH in path:
+                            bridge = AsyncStreamBridge()
+                            active_bridges[event.stream_id] = bridge
+                            
+                            # 创建虚拟 Writer 响应
+                            dummy_writer = DummyWriter(event.stream_id, h2_conn, transport)
+                            
+                            # 发送 200 OK 响应标头回边缘节点，宣告 HTTP/2 通道建立完毕
+                            response_headers = [
+                                (':status', '200'),
+                                ('content-type', 'application/octet-stream'),
+                            ]
+                            h2_conn.send_headers(event.stream_id, response_headers)
+                            transport.write(h2_conn.data_to_send())
+                            
+                            # 将这个 H2 Stream 的双向流引流至本地 VLESS 解包处理器
+                            asyncio.create_task(handle_vless_binary_stream(bridge, dummy_writer))
+                            
+                    elif isinstance(event, h2.events.DataReceived):
+                        # 收到边缘节点下发的代理流量，塞入对应 Stream 的队列中
+                        if event.stream_id in active_bridges:
+                            active_bridges[event.stream_id].put(event.data)
+                            h2_conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                            transport.write(h2_conn.data_to_send())
+                            
+                    elif isinstance(event, h2.events.StreamEnded):
+                        if event.stream_id in active_bridges:
+                            active_bridges[event.stream_id].put(b"") # EOF
+                            del active_bridges[event.stream_id]
+                            
+                    elif isinstance(event, h2.events.ConnectionTerminated):
+                        break
+                        
+                transport.write(h2_conn.data_to_send())
+                
         except Exception:
-            await asyncio.sleep(3)
+            pass
+        await asyncio.sleep(4) # 出现异常断线重连
 
-def start_cf_tunnel():
+def start_cf_tunnel_h2():
     argo_auth = os.environ.get("ARGO_AUTH", ARGO_AUTH)
     if not argo_auth: return
     try:
@@ -493,8 +616,10 @@ def start_cf_tunnel():
         tunnel_secret = base64.b64decode(token_data["s"])
         tunnel_id = uuid.UUID(token_data["t"]).bytes
         account_tag = token_data["a"]
+        
+        # 启动 4 条物理连接信道对齐 Go/Java 原版高可用设计
         for i in range(4):
-            asyncio.create_task(cf_tunnel_connect(i, account_tag, tunnel_secret, tunnel_id))
+            asyncio.create_task(cf_tunnel_h2_worker(i, account_tag, tunnel_secret, tunnel_id))
     except Exception: pass
 
 # ==================== 统一运行入口 ====================
@@ -509,10 +634,9 @@ async def main():
     parser.add_argument("--tls", action="store_true", default=False)
     args = parser.parse_args()
 
-    global current_domain, current_port, tls_mode
-    # 🌟 第一步：先并行获取公网元数据 IP 与国别 (对齐 Java 的逻辑)
     await async_fetch_ip_and_country()
 
+    global current_domain, current_port, tls_mode
     public_ip = cached_public_ip
     if not current_domain or current_domain == "your-domain.com":
         if public_ip and " / " not in public_ip:
@@ -527,25 +651,23 @@ async def main():
         tls_mode = "tls"
         current_port = 443
 
-    # 🌟 第二步：构建全量覆盖凭证字典 (完美复制 Java 的 authHeaders 结构)
     server_addr = args.server if args.server else NEZHA_SERVER
     client_secret = (args.password if args.password else NEZHA_KEY).strip()
     
-    # 双重鉴权头全覆盖：既要照顾老版 metadata 的 password 验证，又要兼容高层安全鉴权
     auth_metadata = [
         ('password', client_secret),
         ('client_secret', client_secret)
     ]
     use_tls = args.tls or ":443" in server_addr
 
-    # 🌟 第三步：彻底隔离为双轨道异步服务线程进行独立挂载
+    # 启动双通道哪吒上报
     asyncio.create_task(run_nezha_task_loop(server_addr, auth_metadata, use_tls))
     asyncio.create_task(fire_dynamic_state_loop(server_addr, auth_metadata, use_tls))
     
-    # 拉起隧道支持
-    start_cf_tunnel()
+    # 启动完全对齐的 H2 隧道
+    start_cf_tunnel_h2()
 
-    # 配置 Aiohttp 静态页面与 WebSocket 统一路由路由表
+    # 配置 HTTP 服务器路由
     app = web.Application()
     app.router.add_get('/', index_handler)
     app.router.add_get('/' + SUB_PATH, sub_handler)
